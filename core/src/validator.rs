@@ -417,6 +417,8 @@ impl ValidatorConfig {
             replay_transactions_threads: max_thread_count,
             tvu_shred_sigverify_threads: NonZeroUsize::new(get_thread_count())
                 .expect("thread count is non-zero"),
+            p3_socket: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 4519)),
+            p3_mev_socket: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 4520)),
             ..Self::default()
         }
     }
