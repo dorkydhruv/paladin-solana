@@ -92,6 +92,12 @@ pub struct SchedulerCountMetricsInner {
     pub min_prioritization_fees: u64,
     /// Max prioritization fees in the transaction container
     pub max_prioritization_fees: u64,
+    // Bundle arbitration metrics
+    pub num_bundle_arbitration_considered: Saturating<usize>,
+    pub num_bundle_arbitration_skipped: Saturating<usize>,
+    pub num_bundle_executed_success: Saturating<usize>,
+    pub num_bundle_executed_failed: Saturating<usize>,
+    pub num_bundle_requeued: Saturating<usize>,
 }
 
 impl IntervalSchedulerCountMetrics {
@@ -146,6 +152,11 @@ impl SchedulerCountMetricsInner {
             num_dropped_on_blacklisted_account: Saturating(num_dropped_on_blacklisted_account),
             min_prioritization_fees: _min_prioritization_fees,
             max_prioritization_fees: _max_prioritization_fees,
+            num_bundle_arbitration_considered: Saturating(num_bundle_arbitration_considered),
+            num_bundle_arbitration_skipped: Saturating(num_bundle_arbitration_skipped),
+            num_bundle_executed_success: Saturating(num_bundle_executed_success),
+            num_bundle_executed_failed: Saturating(num_bundle_executed_failed),
+            num_bundle_requeued: Saturating(num_bundle_requeued),
         } = self;
         let mut datapoint = create_datapoint!(
             @point name,
@@ -197,7 +208,12 @@ impl SchedulerCountMetricsInner {
             ("num_dropped_on_capacity", num_dropped_on_capacity, i64),
             ("min_priority", self.get_min_priority(), i64),
             ("max_priority", self.get_max_priority(), i64),
-            ("num_dropped_on_blacklisted_account", num_dropped_on_blacklisted_account, i64)
+            ("num_dropped_on_blacklisted_account", num_dropped_on_blacklisted_account, i64),
+            ("num_bundle_arbitration_considered", num_bundle_arbitration_considered, i64),
+            ("num_bundle_arbitration_skipped", num_bundle_arbitration_skipped, i64)
+            ,("num_bundle_executed_success", num_bundle_executed_success, i64)
+            ,("num_bundle_executed_failed", num_bundle_executed_failed, i64)
+            ,("num_bundle_requeued", num_bundle_requeued, i64)
         );
         if let Some(slot) = slot {
             datapoint.add_field_i64("slot", slot as i64);
@@ -239,6 +255,11 @@ impl SchedulerCountMetricsInner {
         self.min_prioritization_fees = u64::MAX;
         self.max_prioritization_fees = 0;
         self.num_dropped_on_blacklisted_account = Saturating(0);
+        self.num_bundle_arbitration_considered = Saturating(0);
+        self.num_bundle_arbitration_skipped = Saturating(0);
+        self.num_bundle_executed_success = Saturating(0);
+        self.num_bundle_executed_failed = Saturating(0);
+        self.num_bundle_requeued = Saturating(0);
     }
 
     pub fn update_priority_stats(&mut self, min_max_fees: MinMaxResult<u64>) {

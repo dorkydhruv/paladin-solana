@@ -8,17 +8,22 @@ use {
             qos_service::QosService,
         },
         bundle_stage::{
-            bundle_account_locker::BundleAccountLocker, bundle_consumer::BundleConsumer,
+            bundle_account_locker::BundleAccountLocker,
+            bundle_consumer::BundleConsumer,
             bundle_packet_deserializer::ReceiveBundleResults,
             bundle_packet_receiver::BundleReceiver,
-            bundle_stage_leader_metrics::BundleStageLeaderMetrics, bundle_storage::BundleStorage,
+            bundle_priority_queue::{BundleHandle, BundlePriorityQueue},
+            bundle_stage_leader_metrics::BundleStageLeaderMetrics,
+            bundle_storage::BundleStorage,
             committer::Committer,
         },
+        immutable_deserialized_bundle::ImmutableDeserializedBundle,
         packet_bundle::PacketBundle,
         proxy::block_engine_stage::BlockBuilderFeeInfo,
         tip_manager::TipManager,
     },
     crossbeam_channel::{Receiver, RecvTimeoutError},
+    solana_cost_model::cost_model::CostModel,
     solana_gossip::cluster_info::ClusterInfo,
     solana_ledger::blockstore_processor::TransactionStatusSender,
     solana_measure::measure_us,
@@ -26,8 +31,11 @@ use {
     solana_runtime::{
         prioritization_fee_cache::PrioritizationFeeCache, vote_sender_types::ReplayVoteSender,
     },
+    solana_runtime_transaction::transaction_meta::StaticMeta,
+    solana_svm::transaction_error_metrics::TransactionErrorMetrics,
     solana_time_utils::AtomicInterval,
     std::{
+        collections::HashSet,
         ops::Deref,
         sync::{
             atomic::{AtomicBool, AtomicU64, Ordering},
@@ -39,15 +47,18 @@ use {
 };
 
 pub mod bundle_account_locker;
-mod bundle_consumer;
+pub mod bundle_consumer; // made public for ChannelExecutor single-bundle path reuse
 mod bundle_packet_deserializer;
 mod bundle_packet_receiver;
+pub mod bundle_priority_queue;
 pub(crate) mod bundle_stage_leader_metrics;
 mod bundle_storage;
 mod committer;
-mod front_run_identifier;
+mod front_run_identifier; // expose priority queue skeleton for unified scheduler (exposed)
+                          // no executor module; on-demand execution uses a bare Sender<BundleHandle>
 
-const MAX_BUNDLE_RETRY_DURATION: Duration = Duration::from_millis(40);
+pub const MAX_BUNDLE_RETRY_DURATION: Duration = Duration::from_millis(40); // pub for external single-bundle execution
+#[allow(dead_code)]
 const SLOT_BOUNDARY_CHECK_PERIOD: Duration = Duration::from_millis(10);
 
 // Stats emitted periodically
@@ -194,6 +205,8 @@ impl BundleStageLoopMetrics {
 
 pub struct BundleStage {
     bundle_thread: JoinHandle<()>,
+    _bundle_priority_queue: Option<Arc<BundlePriorityQueue>>,
+    _queue_thread_holder: Arc<Mutex<Option<Arc<BundlePriorityQueue>>>>,
 }
 
 impl BundleStage {
@@ -204,6 +217,7 @@ impl BundleStage {
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         transaction_recorder: TransactionRecorder,
         bundle_receiver: Receiver<Vec<PacketBundle>>,
+        bundle_execution_rx: Receiver<BundleHandle>,
         transaction_status_sender: Option<TransactionStatusSender>,
         replay_vote_sender: ReplayVoteSender,
         log_messages_bytes_limit: Option<usize>,
@@ -212,12 +226,14 @@ impl BundleStage {
         bundle_account_locker: BundleAccountLocker,
         block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
+        bundle_priority_queue: Arc<bundle_priority_queue::BundlePriorityQueue>,
     ) -> Self {
         Self::start_bundle_thread(
             cluster_info,
             poh_recorder,
             transaction_recorder,
             bundle_receiver,
+            bundle_execution_rx,
             transaction_status_sender,
             replay_vote_sender,
             log_messages_bytes_limit,
@@ -227,6 +243,7 @@ impl BundleStage {
             MAX_BUNDLE_RETRY_DURATION,
             block_builder_fee_info,
             prioritization_fee_cache,
+            bundle_priority_queue,
         )
     }
 
@@ -240,6 +257,7 @@ impl BundleStage {
         poh_recorder: &Arc<RwLock<PohRecorder>>,
         transaction_recorder: TransactionRecorder,
         bundle_receiver: Receiver<Vec<PacketBundle>>,
+        bundle_execution_rx: Receiver<BundleHandle>,
         transaction_status_sender: Option<TransactionStatusSender>,
         replay_vote_sender: ReplayVoteSender,
         log_message_bytes_limit: Option<usize>,
@@ -249,6 +267,7 @@ impl BundleStage {
         max_bundle_retry_duration: Duration,
         block_builder_fee_info: &Arc<Mutex<BlockBuilderFeeInfo>>,
         prioritization_fee_cache: &Arc<PrioritizationFeeCache>,
+        bundle_priority_queue: Arc<BundlePriorityQueue>,
     ) -> Self {
         const BUNDLE_STAGE_ID: u32 = 10_000;
         let poh_recorder = poh_recorder.clone();
@@ -270,12 +289,17 @@ impl BundleStage {
             transaction_recorder,
             QosService::new(BUNDLE_STAGE_ID),
             log_message_bytes_limit,
-            tip_manager,
+            tip_manager.clone(),
             bundle_account_locker,
             block_builder_fee_info.clone(),
             max_bundle_retry_duration,
             cluster_info,
         );
+
+        let shared_queue_holder: Arc<
+            Mutex<Option<Arc<bundle_priority_queue::BundlePriorityQueue>>>,
+        > = Arc::new(Mutex::new(Some(bundle_priority_queue)));
+        let thread_queue_holder = shared_queue_holder.clone();
 
         let bundle_thread = Builder::new()
             .name("solBundleStgTx".to_string())
@@ -287,11 +311,18 @@ impl BundleStage {
                     BUNDLE_STAGE_ID,
                     unprocessed_bundle_storage,
                     exit,
+                    thread_queue_holder,
+                    bundle_execution_rx,
+                    tip_manager,
                 );
             })
             .unwrap();
 
-        Self { bundle_thread }
+        Self {
+            bundle_thread,
+            _bundle_priority_queue: None,
+            _queue_thread_holder: shared_queue_holder,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -302,8 +333,11 @@ impl BundleStage {
         id: u32,
         mut bundle_storage: BundleStorage,
         exit: Arc<AtomicBool>,
+        _queue_holder: Arc<Mutex<Option<Arc<BundlePriorityQueue>>>>,
+        bundle_execution_rx: Receiver<BundleHandle>,
+        tip_manager: TipManager,
     ) {
-        let mut last_metrics_update = Instant::now();
+        let _last_metrics_update = Instant::now();
 
         let mut bundle_stage_metrics = BundleStageLoopMetrics::new(id);
         let mut bundle_stage_leader_metrics = BundleStageLeaderMetrics::new(id);
@@ -311,21 +345,34 @@ impl BundleStage {
         let mut batch_bundle_results = ReceiveBundleResults::default();
         let mut batch_bundle_timer: Option<Instant> = None;
 
+        let tip_accounts = tip_manager.get_tip_accounts();
+        let blacklisted_accounts =
+            std::collections::HashSet::from_iter([tip_manager.tip_payment_program_id()]);
+        let mut inserted_ids: HashSet<String> = std::collections::HashSet::new();
+
         while !exit.load(Ordering::Relaxed) {
-            if bundle_storage.unprocessed_bundles_len() > 0
-                || last_metrics_update.elapsed() >= SLOT_BOUNDARY_CHECK_PERIOD
-            {
+            // Drain any on-demand execution requests from the scheduler and execute them immediately
+            let mut demand_storage = BundleStorage::default();
+            let mut demanded: Vec<ImmutableDeserializedBundle> = Vec::new();
+            while let Ok(handle) = bundle_execution_rx.try_recv() {
+                // Clone the underlying immutable bundle from the handle's Arc
+                let bundle: ImmutableDeserializedBundle = handle.inner().as_ref().clone();
+                demanded.push(bundle);
+            }
+            if !demanded.is_empty() {
+                demand_storage.insert_unprocessed_bundles(demanded);
                 let (_, process_buffered_packets_time_us) =
                     measure_us!(Self::process_buffered_bundles(
                         &mut decision_maker,
                         &mut consumer,
                         &mut bundle_storage,
+                        &mut demand_storage,
                         &mut bundle_stage_leader_metrics,
                     ));
                 bundle_stage_leader_metrics
                     .leader_slot_metrics_tracker()
                     .increment_process_buffered_packets_us(process_buffered_packets_time_us);
-                last_metrics_update = Instant::now();
+                // note: metrics update time is tracked via leader metrics trackers
             }
 
             match bundle_receiver.receive_and_buffer_bundles(
@@ -351,6 +398,74 @@ impl BundleStage {
             bundle_stage_metrics.increment_cost_model_buffered_packets_count(
                 bundle_storage.cost_model_buffered_packets_len() as u64,
             );
+
+            // Priority ingest: when a bank is available, compute metas for newly buffered bundles and push into queue
+            if let Some(bank) = decision_maker
+                .make_consume_or_forward_decision()
+                .bank()
+                .cloned()
+            {
+                if let Ok(Some(queue)) = _queue_holder.lock().map(|g| g.clone()) {
+                    for ib in bundle_storage.iter_unprocessed() {
+                        let id = ib.bundle_id().to_string();
+                        if inserted_ids.contains(&id) {
+                            continue;
+                        }
+                        // Try to build sanitized bundle for accurate CU and to validate quickly
+                        let mut err_metrics = TransactionErrorMetrics::default();
+                        let sanitized = match ib.build_sanitized_bundle(
+                            &bank,
+                            &blacklisted_accounts,
+                            &mut err_metrics,
+                        ) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                inserted_ids.insert(id);
+                                continue;
+                            }
+                        };
+                        let total_cu: u64 = sanitized
+                            .transactions
+                            .iter()
+                            .map(|tx| CostModel::calculate_cost(tx, &bank.feature_set).sum())
+                            .sum();
+                        let reward_from_tx: u64 = sanitized
+                            .transactions
+                            .iter()
+                            .map(|tx| {
+                                let limits = tx
+                                    .compute_budget_instruction_details()
+                                    .sanitize_and_convert_to_compute_budget_limits(
+                                        &bank.feature_set,
+                                    )
+                                    .unwrap_or_default();
+                                bank.calculate_reward_for_transaction(
+                                    tx,
+                                    &solana_fee_structure::FeeBudgetLimits::from(limits),
+                                )
+                            })
+                            .sum();
+                        let reward_from_tips: u64 = ib.packets().iter().map(|p| crate::bundle_stage::bundle_storage::BundleStorage::extract_tips_from_packet(p, &tip_accounts)).sum();
+                        let total_reward = reward_from_tx.saturating_add(reward_from_tips);
+                        const MULTIPLIER: u64 = 1_000_000;
+                        let reward_per_cu_scaled =
+                            total_reward.saturating_mul(MULTIPLIER) / total_cu.max(1);
+                        let meta = bundle_priority_queue::BundleMeta {
+                            bundle_id: id.clone(),
+                            total_reward_lamports: total_reward,
+                            total_cu_estimate: total_cu,
+                            reward_per_cu_scaled,
+                            arrival_unix_us:
+                                bundle_priority_queue::BundlePriorityQueue::now_unix_us(),
+                            union_accounts: vec![],
+                            num_transactions: sanitized.transactions.len(),
+                        };
+                        let handle = BundleHandle::new(Arc::new(ib.clone()));
+                        queue.insert(meta, handle);
+                        inserted_ids.insert(id);
+                    }
+                }
+            }
             bundle_stage_metrics.maybe_report(1_000);
         }
     }
@@ -359,7 +474,8 @@ impl BundleStage {
     fn process_buffered_bundles(
         decision_maker: &mut DecisionMaker,
         consumer: &mut BundleConsumer,
-        bundle_storage: &mut BundleStorage,
+        bundle_storage: &mut BundleStorage, // bundle storage to push cost_model_buffered bundles back,
+        demand_storage: &mut BundleStorage, // bundles that came from banking stage arbitration
         bundle_stage_leader_metrics: &mut BundleStageLeaderMetrics,
     ) {
         let (decision, make_decision_time_us) =
@@ -383,7 +499,7 @@ impl BundleStage {
                     .apply_action(metrics_action, banking_stage_metrics_action);
 
                 let (_, consume_buffered_packets_time_us) = measure_us!(consumer
-                    .consume_buffered_bundles(&bank, bundle_storage, bundle_stage_leader_metrics,));
+                    .consume_buffered_bundles(&bank, demand_storage, bundle_stage_leader_metrics,));
                 bundle_stage_leader_metrics
                     .leader_slot_metrics_tracker()
                     .increment_consume_buffered_packets_us(consume_buffered_packets_time_us);

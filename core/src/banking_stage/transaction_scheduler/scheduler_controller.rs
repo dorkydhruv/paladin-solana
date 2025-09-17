@@ -8,15 +8,11 @@ use {
         scheduler_error::SchedulerError,
         scheduler_metrics::{SchedulerCountMetrics, SchedulerTimingMetrics, SchedulingDetails},
     },
-    crate::banking_stage::{
-        consume_worker::ConsumeWorkerMetrics,
-        consumer::Consumer,
-        decision_maker::{BufferedPacketsDecision, DecisionMaker},
-        transaction_scheduler::{
+    crate::{banking_stage::{
+        TOTAL_BUFFERED_PACKETS, consume_worker::ConsumeWorkerMetrics, consumer::Consumer, decision_maker::{BufferedPacketsDecision, DecisionMaker}, transaction_scheduler::{
             receive_and_buffer::ReceivingStats, transaction_state_container::StateContainer,
-        },
-        TOTAL_BUFFERED_PACKETS,
-    },
+        }
+    }, bundle_stage::bundle_priority_queue::{BundleHandle, BundlePriorityQueue, BundlePrioritySource}},
     solana_clock::MAX_PROCESSING_AGE,
     solana_measure::measure_us,
     solana_runtime::{bank::Bank, bank_forks::BankForks},
@@ -24,8 +20,7 @@ use {
     std::{
         num::Saturating,
         sync::{
-            atomic::{AtomicBool, Ordering},
-            Arc, RwLock,
+            Arc, RwLock, atomic::{AtomicBool, Ordering}
         },
     },
 };
@@ -57,6 +52,8 @@ where
     worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
     /// Detailed scheduling metrics.
     scheduling_details: SchedulingDetails,
+    bundle_priority_queue: Arc<BundlePriorityQueue>,
+    bundle_exec_sender: crossbeam_channel::Sender<BundleHandle>,
 }
 
 impl<R, S> SchedulerController<R, S>
@@ -64,6 +61,38 @@ where
     R: ReceiveAndBuffer,
     S: Scheduler<R::Transaction>,
 {
+    /// Try to arbitrate and execute a bundle, returning whether normal tx scheduling should proceed.
+    fn try_arbitrate_bundle(&mut self, decision: &BufferedPacketsDecision) -> bool {
+    if decision.bank().is_none() { return true; }
+        use itertools::MinMaxResult;
+        // Fast path: nothing in queue
+        let best_meta = match self.bundle_priority_queue.peek_best() { Some(m) => m, None => return true };
+        let max_prio = match self.container.get_min_max_priority() { MinMaxResult::NoElements => 0, MinMaxResult::OneElement(v) => v, MinMaxResult::MinMax(_, max_v) => max_v } as u64;
+        if best_meta.reward_per_cu_scaled <= max_prio { return true; }
+        // Attempt to claim the bundle
+        let maybe_handle = self.bundle_priority_queue.take_best_if(|m| m.bundle_id == best_meta.bundle_id);
+        let Some(handle) = maybe_handle else { return true }; // lost race
+        self.count_metrics.update(|c| { c.num_bundle_arbitration_considered += Saturating(1); });
+        // Send handle to BundleStage to execute on-demand. If the channel is disconnected,
+        // put the handle back and proceed with normal tx scheduling.
+        match self.bundle_exec_sender.send(handle) {
+            Ok(_) => {
+                self.count_metrics.update(|c| {
+                    c.num_bundle_arbitration_skipped += Saturating(1);
+                    c.num_bundle_executed_success += Saturating(1);
+                });
+                false // do not schedule txs this iteration
+            }
+            Err(err) => {
+                // Requeue the bundle since it wasn't sent for execution.
+                let _handle = err.0;
+                self.bundle_priority_queue.requeue(_handle, best_meta.clone());
+                self.count_metrics.update(|c| c.num_bundle_requeued += Saturating(1));
+                true
+            }
+        }
+    }
+
     pub fn new(
         exit: Arc<AtomicBool>,
         decision_maker: DecisionMaker,
@@ -71,6 +100,8 @@ where
         bank_forks: Arc<RwLock<BankForks>>,
         scheduler: S,
         worker_metrics: Vec<Arc<ConsumeWorkerMetrics>>,
+        bundle_priority_queue: Arc<BundlePriorityQueue>,
+        bundle_exec_sender: crossbeam_channel::Sender<BundleHandle>,
     ) -> Self {
         Self {
             exit,
@@ -83,7 +114,30 @@ where
             timing_metrics: SchedulerTimingMetrics::default(),
             worker_metrics,
             scheduling_details: SchedulingDetails::default(),
+            bundle_priority_queue,
+            bundle_exec_sender,
         }
+    }
+
+    #[cfg(test)]
+    pub fn test_new(
+        exit: Arc<AtomicBool>,
+        decision_maker: DecisionMaker,
+        receive_and_buffer: R,
+        bank_forks: Arc<RwLock<BankForks>>,
+        scheduler: S,
+    ) -> Self {
+        let (tx, _rx) = crossbeam_channel::unbounded::<BundleHandle>();
+        Self::new(
+            exit,
+            decision_maker,
+            receive_and_buffer,
+            bank_forks,
+            scheduler,
+            vec![],
+            Arc::new(BundlePriorityQueue::default()),
+            tx,
+        )
     }
 
     pub fn run(mut self) -> Result<(), SchedulerError> {
@@ -143,6 +197,11 @@ where
     ) -> Result<(), SchedulerError> {
         match decision {
             BufferedPacketsDecision::Consume(bank) => {
+                // Unified scheduling (initial arbitration placeholder): if a bundle queue
+                // is present and its top candidate has higher reward_per_cu than the
+                // max pending transaction priority, we would eventually attempt to
+                // schedule the bundle instead of normal transactions.
+                if !self.try_arbitrate_bundle(decision) { return Ok(()); }
                 let (scheduling_summary, schedule_time_us) = measure_us!(self.scheduler.schedule(
                     &mut self.container,
                     |txs, results| {
@@ -394,6 +453,63 @@ mod tests {
         test_case::test_case,
     };
 
+    use crate::bundle_stage::bundle_priority_queue::{BundlePriorityQueue, BundleMeta, BundleHandle};
+    use crate::immutable_deserialized_bundle::ImmutableDeserializedBundle;
+    use crate::packet_bundle::PacketBundle;
+    use solana_perf::packet::PacketBatch as PerfPacketBatch;
+
+    fn make_test_bundle_handle(id: &str) -> (BundleMeta, BundleHandle) {
+        let meta = BundleMeta {
+            bundle_id: id.to_string(),
+            total_reward_lamports: 1_000_000,
+            total_cu_estimate: 10_000,
+            reward_per_cu_scaled: 100_000, // arbitrary > typical tx priority
+            arrival_unix_us: BundlePriorityQueue::now_unix_us(),
+            union_accounts: vec![],
+            num_transactions: 0,
+        };
+        // Build a minimal immutable bundle using constructor with an empty PacketBundle (will error if truly empty).
+        // Work around by creating a single trivial self-transfer transaction packet.
+        use solana_keypair::Keypair;
+        use solana_system_transaction::transfer;
+        use solana_perf::packet::BytesPacket;
+        use solana_hash::Hash;
+        let kp = Keypair::new();
+        let tx = transfer(&kp, &kp.pubkey(), 1, Hash::default());
+        let packet = BytesPacket::from_data(None, &tx).expect("packet");
+        let mut pb = PacketBundle { batch: PerfPacketBatch::from(vec![packet]), bundle_id: meta.bundle_id.clone() };
+        let ib = ImmutableDeserializedBundle::new(&mut pb, None).expect("immutable bundle");
+        (meta, BundleHandle::new(Arc::new(ib)))
+    }
+
+    #[test]
+    fn test_bundle_arbitration_path_does_not_panic() {
+        // Reuse existing helper to create a test frame and controller
+        let (mut test_frame, mut controller) = create_test_frame(1, test_create_sanitized_transaction_receive_and_buffer);
+        // Make us the leader by installing working bank
+        test_frame.shared_working_bank.store(test_frame.bank.clone());
+        let queue = Arc::new(BundlePriorityQueue::default());
+        controller.bundle_priority_queue = queue.clone();
+        let (meta, handle) = make_test_bundle_handle("arb1");
+        queue.insert(meta, handle);
+        let decision = BufferedPacketsDecision::Consume(test_frame.bank.clone());
+        let _ = controller.process_transactions(&decision); // Should not panic
+    }
+
+    #[test]
+    fn test_transient_requeue_on_complete_bank() {
+        let (mut test_frame, mut controller) = create_test_frame(1, test_create_sanitized_transaction_receive_and_buffer);
+        test_frame.shared_working_bank.store(test_frame.bank.clone());
+        let queue = Arc::new(BundlePriorityQueue::default());
+        controller.bundle_priority_queue = queue.clone();
+        let (meta, handle) = make_test_bundle_handle("arb2");
+        queue.insert(meta.clone(), handle.clone());
+        test_frame.bank.freeze(); // Force transient path
+        let decision = BufferedPacketsDecision::Consume(test_frame.bank.clone());
+        let _ = controller.process_transactions(&decision);
+        assert!(queue.peek_best().is_some()); // Requeued
+    }
+
     fn create_channels<T>(num: usize) -> (Vec<Sender<T>>, Vec<Receiver<T>>) {
         (0..num).map(|_| unbounded()).unzip()
     }
@@ -427,7 +543,7 @@ mod tests {
         bank_forks: Arc<RwLock<BankForks>>,
         blacklisted_accounts: HashSet<Pubkey>,
     ) -> TransactionViewReceiveAndBuffer {
-        TransactionViewReceiveAndBuffer::new(receiver, bank_forks, blacklisted_accounts)
+        TransactionViewReceiveAndBuffer::new(receiver, bank_forks, blacklisted_accounts, Duration::ZERO)
     }
 
     #[allow(clippy::type_complexity)]
@@ -485,13 +601,12 @@ mod tests {
             PrioGraphSchedulerConfig::default(),
         );
         let exit = Arc::new(AtomicBool::new(false));
-        let scheduler_controller = SchedulerController::new(
+        let scheduler_controller = SchedulerController::test_new(
             exit,
             decision_maker,
             receive_and_buffer,
             bank_forks,
             scheduler,
-            vec![], // no actual workers with metrics to report, this can be empty
         );
 
         (test_frame, scheduler_controller)

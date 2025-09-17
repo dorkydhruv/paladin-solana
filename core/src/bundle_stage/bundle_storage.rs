@@ -68,6 +68,12 @@ impl BundleStorage {
         self.unprocessed_bundle_storage.len()
     }
 
+    /// Iterate over currently unprocessed bundles without draining.
+    /// Intended for introspection (e.g., populating a priority view) without mutation.
+    pub fn iter_unprocessed(&self) -> impl Iterator<Item = &ImmutableDeserializedBundle> {
+        self.unprocessed_bundle_storage.iter()
+    }
+
     pub fn unprocessed_packets_len(&self) -> usize {
         self.unprocessed_bundle_storage
             .iter()

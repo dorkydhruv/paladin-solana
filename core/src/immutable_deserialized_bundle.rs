@@ -65,7 +65,7 @@ pub enum DeserializedBundleError {
     InvalidComputeBudgetLimits,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ImmutableDeserializedBundle {
     bundle_id: String,
     packets: Vec<ImmutableDeserializedPacket>,

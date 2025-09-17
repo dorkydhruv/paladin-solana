@@ -436,6 +436,11 @@ impl Tpu {
         let mut blacklisted_accounts = HashSet::new();
         blacklisted_accounts.insert(tip_manager.tip_payment_program_id());
 
+        // Shared priority queue (created here) and inline executor (no background thread)
+        let bundle_priority_queue =
+            Arc::new(crate::bundle_stage::bundle_priority_queue::BundlePriorityQueue::default());
+        // On-demand bundle execution channel: scheduler sends BundleHandle to BundleStage
+        let (bundle_exec_tx, bundle_exec_rx) = crossbeam_channel::unbounded();
         let banking_stage = BankingStage::new_num_threads(
             block_production_method,
             transaction_struct,
@@ -460,6 +465,8 @@ impl Tpu {
                 )
             },
             batch_interval,
+            bundle_priority_queue.clone(),
+            bundle_exec_tx.clone(),
         );
 
         let SpawnForwardingStageResult {
@@ -475,18 +482,20 @@ impl Tpu {
         );
 
         let bundle_stage = BundleStage::new(
-            cluster_info,
-            poh_recorder,
-            transaction_recorder,
+            &cluster_info,
+            &poh_recorder,
+            transaction_recorder.clone(),
             bundle_receiver,
-            transaction_status_sender,
-            replay_vote_sender,
+            bundle_exec_rx,
+            transaction_status_sender.clone(),
+            replay_vote_sender.clone(),
             log_messages_bytes_limit,
             exit.clone(),
             tip_manager,
             bundle_account_locker,
             &block_builder_fee_info,
-            prioritization_fee_cache,
+            &prioritization_fee_cache,
+            bundle_priority_queue.clone(),
         );
 
         let (entry_receiver, tpu_entry_notifier) =

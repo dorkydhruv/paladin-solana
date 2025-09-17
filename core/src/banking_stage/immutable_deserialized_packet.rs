@@ -46,8 +46,7 @@ pub enum DeserializedPacketError {
 static FEATURE_SET: std::sync::LazyLock<FeatureSet> =
     std::sync::LazyLock::new(FeatureSet::all_enabled);
 
-#[derive(Debug)]
-#[cfg_attr(test, derive(Clone))]
+#[derive(Debug, Clone)]
 pub struct ImmutableDeserializedPacket {
     transaction: SanitizedVersionedTransaction,
     forwarded: bool,

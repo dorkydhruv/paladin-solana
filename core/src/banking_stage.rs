@@ -2,8 +2,10 @@
 //! to construct a software pipeline. The stage uses all available CPU cores and
 //! can do its processing in parallel with signature verification on the GPU.
 
+use crate::bundle_stage::bundle_priority_queue::{BundleHandle, BundlePriorityQueue};
 #[cfg(feature = "dev-context-only-utils")]
 use qualifier_attr::qualifiers;
+
 use {
     self::{
         committer::Committer, consumer::Consumer, decision_maker::DecisionMaker,
@@ -15,6 +17,7 @@ use {
             packet_deserializer::PacketDeserializer,
             transaction_scheduler::{
                 prio_graph_scheduler::PrioGraphScheduler,
+                receive_and_buffer::SanitizedTransactionReceiveAndBuffer,
                 scheduler_controller::SchedulerController, scheduler_error::SchedulerError,
             },
         },
@@ -49,9 +52,7 @@ use {
     transaction_scheduler::{
         greedy_scheduler::{GreedyScheduler, GreedySchedulerConfig},
         prio_graph_scheduler::PrioGraphSchedulerConfig,
-        receive_and_buffer::{
-            ReceiveAndBuffer, SanitizedTransactionReceiveAndBuffer, TransactionViewReceiveAndBuffer,
-        },
+        receive_and_buffer::{ReceiveAndBuffer, TransactionViewReceiveAndBuffer},
         transaction_state_container::TransactionStateContainer,
     },
     vote_worker::VoteWorker,
@@ -382,6 +383,10 @@ impl BankingStage {
         bundle_account_locker: BundleAccountLocker,
         block_cost_limit_reservation_cb: impl Fn(&Bank) -> u64 + Clone + Send + 'static,
         batch_interval: Duration,
+        bundle_priority_queue: Arc<crate::bundle_stage::bundle_priority_queue::BundlePriorityQueue>,
+        bundle_exec_sender: crossbeam_channel::Sender<
+            crate::bundle_stage::bundle_priority_queue::BundleHandle,
+        >,
     ) -> Self {
         let committer = Committer::new(
             transaction_status_sender,
@@ -413,6 +418,8 @@ impl BankingStage {
             bank_forks,
             committer,
             log_messages_bytes_limit,
+            bundle_priority_queue: bundle_priority_queue.clone(),
+            bundle_exec_sender: bundle_exec_sender.clone(),
         };
         let non_vote_thread_hdls = Self::new_central_scheduler(
             transaction_struct,
@@ -550,6 +557,8 @@ impl BankingStage {
                                 context.bank_forks.clone(),
                                 $scheduler,
                                 worker_metrics,
+                                context.bundle_priority_queue.clone(),
+                                context.bundle_exec_sender.clone(),
                             );
 
                             match scheduler_controller.run() {
@@ -658,6 +667,8 @@ struct BankingStageNonVoteContext {
     bank_forks: Arc<RwLock<BankForks>>,
     committer: Committer,
     log_messages_bytes_limit: Option<usize>,
+    bundle_priority_queue: Arc<BundlePriorityQueue>,
+    bundle_exec_sender: crossbeam_channel::Sender<BundleHandle>,
 }
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
@@ -743,6 +754,8 @@ mod tests {
         let (exit, poh_recorder, transaction_recorder, poh_service, _entry_receiever) =
             create_test_recorder(bank, blockstore, None, None);
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
+        let bundle_priority_queue = Arc::new(BundlePriorityQueue::default());
+        let (bundle_exec_tx, _bundle_exec_rx) = crossbeam_channel::unbounded::<BundleHandle>();
 
         let banking_stage = BankingStage::new_num_threads(
             BlockProductionMethod::CentralScheduler,
@@ -762,6 +775,8 @@ mod tests {
             BundleAccountLocker::default(),
             |_| 0,
             Duration::ZERO,
+            bundle_priority_queue,
+            bundle_exec_tx,
         );
         drop(non_vote_sender);
         drop(tpu_vote_sender);
@@ -822,6 +837,8 @@ mod tests {
             BundleAccountLocker::default(),
             |_| 0,
             Duration::ZERO,
+            Arc::new(BundlePriorityQueue::default()),
+            crossbeam_channel::unbounded::<BundleHandle>().0,
         );
         trace!("sending bank");
         drop(non_vote_sender);
@@ -891,6 +908,8 @@ mod tests {
             BundleAccountLocker::default(),
             |_| 0,
             Duration::ZERO,
+            Arc::new(BundlePriorityQueue::default()),
+            crossbeam_channel::unbounded::<BundleHandle>().0,
         );
 
         // good tx, and no verify
@@ -1046,6 +1065,13 @@ mod tests {
                 BundleAccountLocker::default(),
                 |_| 0,
                 Duration::ZERO,
+                Arc::new(
+                    crate::bundle_stage::bundle_priority_queue::BundlePriorityQueue::default(),
+                ),
+                crossbeam_channel::unbounded::<
+                    crate::bundle_stage::bundle_priority_queue::BundleHandle,
+                >()
+                .0,
             );
 
             // wait for banking_stage to eat the packets
@@ -1237,6 +1263,8 @@ mod tests {
             BundleAccountLocker::default(),
             |_| 0,
             Duration::ZERO,
+            Arc::new(BundlePriorityQueue::default()),
+            crossbeam_channel::unbounded::<BundleHandle>().0,
         );
 
         let keypairs = (0..100).map(|_| Keypair::new()).collect_vec();
@@ -1368,6 +1396,8 @@ mod tests {
                         BundleAccountLocker::default(),
                         |_| 0,
                         Duration::ZERO,
+                        Arc::new(BundlePriorityQueue::default()),
+                        crossbeam_channel::unbounded::<BundleHandle>().0,
                     );
 
                     // bad tx

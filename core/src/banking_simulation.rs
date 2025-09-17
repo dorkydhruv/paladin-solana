@@ -8,7 +8,10 @@ use {
             BankingTracer, ChannelLabel, Channels, TimedTracedEvent, TracedEvent, TracedSender,
             TracerThread, BANKING_TRACE_DIR_DEFAULT_BYTE_LIMIT, BASENAME,
         },
-        bundle_stage::bundle_account_locker::BundleAccountLocker,
+        bundle_stage::{
+            bundle_account_locker::BundleAccountLocker,
+            bundle_priority_queue::{BundleHandle, BundlePriorityQueue},
+        },
         validator::{BlockProductionMethod, TransactionStructure},
     },
     agave_banking_stage_ingress_types::BankingPacketBatch,
@@ -822,6 +825,8 @@ impl BankingSimulator {
 
         info!("Start banking stage!...");
         let prioritization_fee_cache = &Arc::new(PrioritizationFeeCache::new(0u64));
+        let bundle_priority_queue = Arc::new(BundlePriorityQueue::default());
+        let (bundle_exec_tx, _bundle_exec_rx) = crossbeam_channel::unbounded::<BundleHandle>();
         let banking_stage = BankingStage::new_num_threads(
             block_production_method.clone(),
             transaction_struct.clone(),
@@ -840,6 +845,8 @@ impl BankingSimulator {
             BundleAccountLocker::default(),
             |_| 0,
             Duration::ZERO,
+            bundle_priority_queue,
+            bundle_exec_tx,
         );
 
         let (&_slot, &raw_base_event_time) = freeze_time_by_slot
